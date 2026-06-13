@@ -1,98 +1,53 @@
 package com.utl.idgs903.angel.iasimplemanoscuerpo
 
-import android.Manifest
-import android.content.pm.PackageManager
+import android.app.TimePickerDialog
+import android.content.Intent
 import android.os.Bundle
-import android.util.Log
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.core.content.ContextCompat
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.framework.image.MPImage
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
-import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
-import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import com.utl.idgs903.angel.iasimplemanoscuerpo.databinding.ActivityMainBinding
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-    private lateinit var cameraExecutor: ExecutorService
-
-    private var poseLandmarker: PoseLandmarker? = null
-    private var handLandmarker: HandLandmarker? = null
-    
-    private val gestureAnalyzer = GestureAnalyzer()
-
-    private var lastPoseResult: PoseLandmarkerResult? = null
-    private var lastHandResult: HandLandmarkerResult? = null
-    
-    private var lastImageWidth: Int = 1
-    private var lastImageHeight: Int = 1
-
-    private fun setupGestureAnalyzerCallback() {
-        gestureAnalyzer.onComboCompleted = { combo ->
-            runOnUiThread {
-                Toast.makeText(this@MainActivity, "¡COMBO '${combo.name.uppercase()}' COMPLETADO!", Toast.LENGTH_LONG).show()
-                try {
-                    val toneGen = android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 100)
-                    toneGen.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 500)
-                } catch (e: Exception) {
-                    Log.e("Audio", "Error al reproducir sonido", e)
-                }
-                
-                // Reiniciar secuencia después de 3 segundos
-                binding.overlayView.postDelayed({
-                    gestureAnalyzer.sequenceDetector.resetAll()
-                }, 3000)
-            }
-        }
-    }
-
     private var cameraMode = 0 // 0: Frontal, 1: Trasera, 2: Wi-Fi IP
     private var ipCameraUrl = ""
-    private var mjpegStreamReader: MjpegStreamReader? = null
 
-    private val requestPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
-            if (isGranted) {
-                startCamera()
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val updateRunnable = object : Runnable {
+        override fun run() {
+            if (CameraSharedState.isServiceRunning) {
+                CameraSharedState.latestBitmap?.let { bmp ->
+                    binding.viewFinder.setImageBitmap(bmp)
+                }
+
+                binding.overlayView.updateResults(
+                    CameraSharedState.lastPoseResult,
+                    CameraSharedState.lastHandResult,
+                    CameraSharedState.imageWidth,
+                    CameraSharedState.imageHeight
+                )
+                
+                binding.overlayView.updateAction(CameraSharedState.currentAction)
             } else {
-                Toast.makeText(this, "Permiso de cámara denegado", Toast.LENGTH_SHORT).show()
+                binding.viewFinder.setImageBitmap(null)
+                binding.overlayView.updateResults(null, null, 1, 1)
             }
+            uiHandler.postDelayed(this, 33) // ~30 fps
         }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        
+
         binding.root.setOnLongClickListener {
-            val intent = android.content.Intent(this, ComboListActivity::class.java)
+            val intent = Intent(this, ComboListActivity::class.java)
             startActivity(intent)
             true
-        }
-
-        cameraExecutor = Executors.newSingleThreadExecutor()
-
-        setupGestureAnalyzerCallback()
-        setupMediaPipe()
-
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
 
         binding.btnSwitchCamera.setOnClickListener {
@@ -104,12 +59,86 @@ class MainActivity : AppCompatActivity() {
                     if (cameraMode == 2) {
                         showIpCameraDialog()
                     } else {
-                        startCamera()
+                        if (binding.switchService.isChecked) {
+                            startCameraService()
+                        }
                     }
                     dialog.dismiss()
                 }
                 .show()
         }
+
+        binding.switchService.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                if (cameraMode == 2 && ipCameraUrl.isEmpty()) {
+                    showIpCameraDialog()
+                } else {
+                    startCameraService()
+                }
+            } else {
+                stopCameraService()
+            }
+        }
+
+        binding.btnSchedule.setOnClickListener {
+            showScheduleDialog()
+        }
+
+        updateScheduleButtonUI()
+    }
+
+    private fun showScheduleDialog() {
+        val options = arrayOf("Activo 24/7", "Programar Horario")
+        val currentSelection = if (PrefsManager.isScheduleEnabled(this)) 1 else 0
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Configurar Horario")
+            .setSingleChoiceItems(options, currentSelection) { dialog, which ->
+                if (which == 0) {
+                    PrefsManager.setScheduleEnabled(this, false)
+                    updateScheduleButtonUI()
+                    notifyServiceScheduleChanged()
+                    dialog.dismiss()
+                } else {
+                    dialog.dismiss()
+                    showTimePickerForStart()
+                }
+            }
+            .show()
+    }
+
+    private fun showTimePickerForStart() {
+        val currentHour = PrefsManager.getStartHour(this)
+        val currentMinute = PrefsManager.getStartMinute(this)
+        
+        TimePickerDialog(this, { _, hour, minute ->
+            PrefsManager.setStartHour(this, hour)
+            PrefsManager.setStartMinute(this, minute)
+            showTimePickerForEnd()
+        }, currentHour, currentMinute, true).apply {
+            setTitle("Hora de INICIO")
+            show()
+        }
+    }
+
+    private fun showTimePickerForEnd() {
+        val currentHour = PrefsManager.getEndHour(this)
+        val currentMinute = PrefsManager.getEndMinute(this)
+        
+        TimePickerDialog(this, { _, hour, minute ->
+            PrefsManager.setEndHour(this, hour)
+            PrefsManager.setEndMinute(this, minute)
+            PrefsManager.setScheduleEnabled(this, true)
+            updateScheduleButtonUI()
+            notifyServiceScheduleChanged()
+        }, currentHour, currentMinute, true).apply {
+            setTitle("Hora de FIN")
+            show()
+        }
+    }
+
+    private fun updateScheduleButtonUI() {
+        binding.btnSchedule.text = "🕒 " + PrefsManager.getScheduleString(this)
     }
 
     private fun showIpCameraDialog() {
@@ -122,167 +151,70 @@ class MainActivity : AppCompatActivity() {
             .setView(input)
             .setPositiveButton("Conectar") { _, _ ->
                 ipCameraUrl = input.text.toString()
-                startCamera()
+                binding.switchService.isChecked = true
+                startCameraService()
             }
             .setNegativeButton("Cancelar") { _, _ ->
-                cameraMode = 0
-                startCamera()
+                if (!CameraSharedState.isServiceRunning) {
+                    binding.switchService.isChecked = false
+                }
             }
             .show()
     }
 
+    private fun startCameraService() {
+        val intent = Intent(this, BackgroundCameraService::class.java).apply {
+            action = BackgroundCameraService.ACTION_START
+            putExtra(BackgroundCameraService.EXTRA_CAMERA_MODE, cameraMode)
+            putExtra(BackgroundCameraService.EXTRA_IP_URL, ipCameraUrl)
+        }
+        androidx.core.content.ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun stopCameraService() {
+        val intent = Intent(this, BackgroundCameraService::class.java).apply {
+            action = BackgroundCameraService.ACTION_STOP
+        }
+        startService(intent)
+    }
+
+    private fun notifyServiceScheduleChanged() {
+        if (CameraSharedState.isServiceRunning) {
+            val intent = Intent(this, BackgroundCameraService::class.java).apply {
+                action = BackgroundCameraService.ACTION_UPDATE_SCHEDULE
+            }
+            startService(intent)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
-        val combos = SecuenciaConfigManager.loadCombos(this)
-        gestureAnalyzer.sequenceDetector.updateCombos(combos)
-    }
-
-    private fun setupMediaPipe() {
-        val poseBaseOptions = BaseOptions.builder()
-            .setModelAssetPath("pose_landmarker_full.task")
-            .setDelegate(com.google.mediapipe.tasks.core.Delegate.GPU)
-            .build()
-        val poseOptions = PoseLandmarker.PoseLandmarkerOptions.builder()
-            .setBaseOptions(poseBaseOptions)
-            .setRunningMode(RunningMode.LIVE_STREAM)
-            .setResultListener { result, _ ->
-                lastPoseResult = result
-                analyzeGestures()
-            }
-            .setErrorListener { error ->
-                Log.e("MediaPipe", "Error in pose: ${error.message}")
-            }
-            .build()
-        poseLandmarker = PoseLandmarker.createFromOptions(this, poseOptions)
-
-        val handBaseOptions = BaseOptions.builder()
-            .setModelAssetPath("hand_landmarker.task")
-            .setDelegate(com.google.mediapipe.tasks.core.Delegate.GPU)
-            .build()
-        val handOptions = HandLandmarker.HandLandmarkerOptions.builder()
-            .setBaseOptions(handBaseOptions)
-            .setRunningMode(RunningMode.LIVE_STREAM)
-            .setNumHands(2)
-            .setResultListener { result, _ ->
-                lastHandResult = result
-                analyzeGestures()
-            }
-            .setErrorListener { error ->
-                Log.e("MediaPipe", "Error in hand: ${error.message}")
-            }
-            .build()
-        handLandmarker = HandLandmarker.createFromOptions(this, handOptions)
-    }
-
-    private fun analyzeGestures() {
-        val isFrontCamera = cameraMode == 0
-        val action = gestureAnalyzer.analyze(lastPoseResult, lastHandResult, isFrontCamera)
-        runOnUiThread {
-            binding.overlayView.updateAction(action)
-            binding.overlayView.updateResults(lastPoseResult, lastHandResult, lastImageWidth, lastImageHeight)
-        }
-    }
-
-    private fun startCamera() {
-        mjpegStreamReader?.stop()
-        mjpegStreamReader = null
-
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-
-        cameraProviderFuture.addListener({
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
-            cameraProvider.unbindAll()
-
-            if (cameraMode == 2) {
-                // Modo Wi-Fi IP
-                if (ipCameraUrl.isNotEmpty()) {
-                    mjpegStreamReader = MjpegStreamReader(ipCameraUrl) { bitmap ->
-                        processBitmap(bitmap)
-                    }
-                    mjpegStreamReader?.start()
+        binding.switchService.setOnCheckedChangeListener(null)
+        binding.switchService.isChecked = CameraSharedState.isServiceRunning
+        binding.switchService.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                if (cameraMode == 2 && ipCameraUrl.isEmpty()) {
+                    showIpCameraDialog()
+                } else {
+                    startCameraService()
                 }
-                return@addListener
-            }
-
-            // Modo Local
-            val preview = Preview.Builder()
-                .build()
-                .also {
-                    it.setSurfaceProvider(binding.viewFinder.surfaceProvider)
-                }
-
-            val imageAnalyzer = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        processImageProxy(imageProxy)
-                    }
-                }
-
-            val cameraSelector = if (cameraMode == 0) {
-                CameraSelector.DEFAULT_FRONT_CAMERA
             } else {
-                CameraSelector.DEFAULT_BACK_CAMERA
+                stopCameraService()
             }
+        }
+        updateScheduleButtonUI()
 
-            try {
-                cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageAnalyzer
-                )
-            } catch (exc: Exception) {
-                Log.e("CameraX", "Fallo al vincular casos de uso", exc)
+        if (CameraSharedState.isServiceRunning) {
+            val intent = Intent(this, BackgroundCameraService::class.java).apply {
+                action = BackgroundCameraService.ACTION_RELOAD_COMBOS
             }
-
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun processImageProxy(imageProxy: ImageProxy) {
-        val bitmapBuffer = android.graphics.Bitmap.createBitmap(
-            imageProxy.width,
-            imageProxy.height,
-            android.graphics.Bitmap.Config.ARGB_8888
-        )
-        imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-        
-        val matrix = android.graphics.Matrix()
-        matrix.postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-        if (cameraMode == 0) {
-            matrix.postScale(-1f, 1f) // Mirror for front camera
+            startService(intent)
         }
-        val rotatedBitmap = android.graphics.Bitmap.createBitmap(
-            bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height, matrix, false
-        )
-        
-        processBitmap(rotatedBitmap)
+        uiHandler.post(updateRunnable)
     }
 
-    private fun processBitmap(bitmap: android.graphics.Bitmap) {
-        lastImageWidth = bitmap.width
-        lastImageHeight = bitmap.height
-
-        val mpImage = BitmapImageBuilder(bitmap).build()
-        val timestamp = System.currentTimeMillis()
-
-        try {
-            poseLandmarker?.detectAsync(mpImage, timestamp)
-            handLandmarker?.detectAsync(mpImage, timestamp)
-        } catch (e: Exception) {
-            Log.e("MediaPipe", "Error al procesar bitmap: ${e.message}")
-        }
-    }
-
-
-
-    private fun allPermissionsGranted() = ContextCompat.checkSelfPermission(
-        this, Manifest.permission.CAMERA
-    ) == PackageManager.PERMISSION_GRANTED
-
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
-        poseLandmarker?.close()
-        handLandmarker?.close()
+    override fun onPause() {
+        super.onPause()
+        uiHandler.removeCallbacks(updateRunnable)
     }
 }

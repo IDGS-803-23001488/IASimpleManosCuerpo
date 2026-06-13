@@ -45,6 +45,9 @@ dependencies {
     implementation(libs.camerax.lifecycle)
     implementation(libs.camerax.view)
     
+    // Lifecycle Service
+    implementation("androidx.lifecycle:lifecycle-service:2.6.2")
+    
     // MediaPipe
     implementation(libs.mediapipe.tasks.vision)
 

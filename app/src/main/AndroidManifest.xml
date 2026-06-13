@@ -33,6 +33,12 @@
             </intent-filter>
         </activity>
 
+        <service
+            android:name=".BackgroundCameraService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
+
         <activity android:name=".MainActivity" android:theme="@style/Theme.AppCompat.NoActionBar"/>
 
         <activity android:name=".SecuenciaConfigActivity" android:theme="@style/Theme.AppCompat.NoActionBar"/>
